@@ -46,6 +46,7 @@ def render(recalculate_fn=None) -> None:
                 st.success(f"✅ Wczytano {len(loaded)} narzędzi.")
                 st.rerun()
 
+    st.info("Zmiany w Tools zostaną użyte w kalkulacji po kliknięciu: 💾 Zapisz tabelę Tools albo 🔄 Przelicz Profitability po zmianie Tools.")
     df_tl = st.session_state.get("post_tools_df", empty_tools_df())
 
     with st.expander("➕ Dodaj nowe narzędzie", expanded=False):
