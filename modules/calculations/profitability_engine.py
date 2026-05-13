@@ -1,0 +1,706 @@
+"""profitability_engine.py — core PostKalkulacja calculation engine."""
+from __future__ import annotations
+
+import re
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from modules.readers.baza_reader import read_post_list
+from modules.readers.generic_reader import read_generic, read_with_header_detect
+from modules.readers.czasy_reader import read_czasy
+from modules.readers.orders_reader import read_prekalk_orders
+from modules.readers.tektura_reader import read_prekalk_tektura
+from modules.readers.material_service_reader import read_prekalk_material_service
+from modules.readers.wydajnosc_reader import lookup_wydajnosc_row
+from modules.utils.matching import fcol, norm_df
+from modules.utils.helpers import sn, batch_label, rate_for_machine, extract_fry_fragment
+
+
+# ── Classification helpers ────────────────────────────────────────────────────
+
+def classify_do(zp: str, czasy_idx: dict[str, set]) -> str:
+    zp = str(zp).strip()
+    if zp not in czasy_idx:
+        return ""
+    machines = czasy_idx[zp]
+    HP_KW = {"hp35k", "hp7k", "hp 35", "hp 7", "hp 1", "hp indigo"}
+    HD_KW = {"heidelberg cx 104", "heidelberg cx104", "heidelberg"}
+    is_hp = any(any(kw in m for kw in HP_KW) for m in machines)
+    is_hd = any(any(kw in m for kw in HD_KW) for m in machines)
+    if is_hp:
+        return "Digital"
+    if is_hd:
+        return "Offset"
+    return "no printing"
+
+
+def exclude_oticon_zam_rows(df: pd.DataFrame, klient_col: str | None = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    zam_c = fcol(df, "Zamówienie", "Zamowienie")
+    if not zam_c:
+        return df
+    if not klient_col or klient_col not in df.columns:
+        klient_col = fcol(df, "Klient", "Klient ID")
+    if not klient_col or klient_col not in df.columns:
+        return df
+    client_mask = df[klient_col].fillna("").astype(str).str.contains(
+        r"Oticon\s*A/S\s*/\s*DGS\s*Denmark|Oticon|DGS\s*Denmark",
+        case=False, regex=True, na=False,
+    )
+    zam_mask = df[zam_c].fillna("").astype(str).str.contains(
+        "ZAM", case=False, regex=False, na=False,
+    )
+    return df.loc[~(client_mask & zam_mask)].copy()
+
+
+# ── Farby reader ──────────────────────────────────────────────────────────────
+
+def read_farby_pivot(uf) -> pd.DataFrame | None:
+    if uf is None:
+        return None
+    try:
+        import io
+        raw = uf.read()
+        uf.seek(0)
+        xl = pd.ExcelFile(io.BytesIO(raw))
+        sheet = next(
+            (s for s in xl.sheet_names if "pivot" in s.lower() or "farb" in s.lower()),
+            xl.sheet_names[0],
+        )
+        probe = pd.read_excel(io.BytesIO(raw), sheet_name=sheet, header=None, nrows=8)
+        hrow = 0
+        for i, row in probe.iterrows():
+            vals = [str(v).strip() for v in row.dropna()]
+            if "Etykiety wierszy" in vals or "Suma koszt farby2" in vals:
+                hrow = i
+                break
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=sheet, header=hrow)
+        return norm_df(df)
+    except Exception as exc:
+        st.warning(f"⚠️ Błąd pliku Farby: {exc}")
+        return None
+
+
+def read_click_costs(uf) -> dict[str, dict[str, float]]:
+    if uf is None:
+        return {}
+    try:
+        import io
+        raw = uf.read()
+        uf.seek(0)
+        probe = pd.read_excel(io.BytesIO(raw), header=None, nrows=15)
+        hrow = 0
+        for i, row in probe.iterrows():
+            vals = [str(v).strip().lower() for v in row.dropna()]
+            if (any(v in {"maszyna", "press name", "machine", "maszyna (press name)"} for v in vals)
+                    and any("koszt" in v or "cost" in v for v in vals)):
+                hrow = i
+                break
+        df = pd.read_excel(io.BytesIO(raw), header=hrow)
+        df = norm_df(df)
+        mach_c = fcol(df, "Maszyna (Press Name)", "Press Name", "Maszyna", "Machine")
+        color_c = fcol(df, "Kolor", "Color")
+        cost_c = fcol(df, "Koszt PLN/sep", "Koszt", "Cost", "Click cost",
+                      "Koszt klików", "Koszt klikow")
+        if not (mach_c and cost_c):
+            return {}
+        if not color_c:
+            df["Kolor"] = "default"
+            color_c = "Kolor"
+        out: dict[str, dict[str, float]] = {}
+        for _, row in df.dropna(subset=[mach_c]).iterrows():
+            mach = str(row.get(mach_c, "")).strip()
+            color = str(row.get(color_c, "default")).strip() or "default"
+            if mach:
+                out.setdefault(mach, {})[color] = sn(row.get(cost_c, 0))
+        return out
+    except Exception as exc:
+        st.warning(f"⚠️ Błąd kosztów klików: {exc}")
+        return {}
+
+
+# ── Main engine ───────────────────────────────────────────────────────────────
+
+def build_profitability(
+    uf_base,
+    uf_czasy,
+    uf_zlec,
+    uf_fry,
+    uf_inks,
+    uf_farby,
+    rates: dict,
+    click_costs: dict,
+    prepress: dict,
+    pp_digital: float,
+    pp_offset: float,
+    other_pct: float,
+    uf_orders=None,
+    uf_tektura=None,
+    uf_material=None,
+    df_tools: pd.DataFrame | None = None,
+    df_wydajnosc: pd.DataFrame | None = None,
+) -> tuple[dict | None, list[str]]:
+    """
+    Main PostKalkulacja calculation.
+    Returns (result_dict, warnings_list).
+    """
+    warns: list[str] = []
+
+    # ── 1. BASE ───────────────────────────────────────────────────────────────
+    df = read_post_list(uf_base)
+    if df is None:
+        return None, ["Nie można wczytać pliku Bazy."]
+
+    numer_c = fcol(df, "Numer")
+    zam_c = fcol(df, "Zamówienie")
+    qty_c = fcol(df, "Zamawiana ilość", "Zamawiana ilosc")
+    klient_c = fcol(df, "Klient", "Klient ID")
+
+    for req_col in ["Numer", "Zamówienie", "Zamawiana ilość"]:
+        if fcol(df, req_col) is None:
+            warns.append(f"Brak wymaganej kolumny w Bazie: '{req_col}'")
+
+    df["Zlecenie produkcyjne"] = (
+        df[numer_c].astype(str).str.split("-").str[0].str.strip()
+        if numer_c else ""
+    )
+    df["Lewy 10"] = df[zam_c].astype(str).str[:10] if zam_c else ""
+    df["Batch"] = df[qty_c].apply(batch_label) if qty_c else ""
+
+    # ── 2. CZASY ─────────────────────────────────────────────────────────────
+    df_czasy_raw = read_czasy(uf_czasy)
+    machine_cols: list[str] = []
+    czasy_idx: dict[str, set] = {}
+
+    if df_czasy_raw is not None:
+        nzp_c = fcol(df_czasy_raw, "Numer zlecenia produkcyjnego")
+        nm_c = fcol(df_czasy_raw, "Nazwa maszyny")
+        czas_c = fcol(df_czasy_raw, "Czas czynnosci [min]", "Czas czynności [min]", "Suma z Czas czynnosci [min]", "Suma z Czas czynności [min]", "Czas [min]", "Czas")
+
+        if nzp_c and nm_c and czas_c:
+            df_czasy_raw[nzp_c] = df_czasy_raw[nzp_c].astype(str).str.strip()
+            df_czasy_raw[nm_c] = df_czasy_raw[nm_c].fillna("").astype(str).str.strip()
+            df_czasy_raw = df_czasy_raw[df_czasy_raw[nm_c] != ""].copy()
+            df_czasy_raw[czas_c] = pd.to_numeric(
+                df_czasy_raw[czas_c], errors="coerce"
+            ).fillna(0)
+
+            for zp, grp in df_czasy_raw.groupby(nzp_c):
+                czasy_idx[zp] = set(grp[nm_c].str.lower())
+
+            df_czasy_raw["_rate"] = df_czasy_raw[nm_c].apply(
+                lambda m: rate_for_machine(m, rates)
+            )
+            df_czasy_raw["Koszt pracy"] = (
+                df_czasy_raw[czas_c] / 60.0 * df_czasy_raw["_rate"]
+            )
+
+            machines = sorted(df_czasy_raw[nm_c].dropna().unique())
+            machine_cols = [str(m).strip() for m in machines]
+
+            pivot = (
+                df_czasy_raw.pivot_table(
+                    index=nzp_c, columns=nm_c,
+                    values="Koszt pracy", aggfunc="sum", fill_value=0,
+                ).reset_index()
+            )
+            pivot.columns = [str(c).strip() for c in pivot.columns]
+            pivot.rename(columns={nzp_c: "_zp_key"}, inplace=True)
+
+            df = df.merge(
+                pivot,
+                left_on="Zlecenie produkcyjne",
+                right_on="_zp_key",
+                how="left",
+            )
+            df.drop(columns=["_zp_key"], errors="ignore", inplace=True)
+            for mc in machine_cols:
+                if mc in df.columns:
+                    df[mc] = pd.to_numeric(df[mc], errors="coerce").fillna(0)
+                else:
+                    df[mc] = 0.0
+        else:
+            warns.append("Plik Czasy: brak kolumn NZP / Nazwa maszyny / Czas.")
+            df_czasy_raw = None
+    elif uf_czasy:
+        warns.append("Nie można wczytać pliku Czasy.")
+
+    df["Digital/Offset"] = df["Zlecenie produkcyjne"].apply(
+        lambda zp: classify_do(zp, czasy_idx)
+    )
+
+    if not machine_cols:
+        warns.append("Brak pliku Czasy – Total DL z Prepress costs only.")
+
+    # ── 3. FARBY ─────────────────────────────────────────────────────────────
+    df_farby_pivot = read_farby_pivot(uf_farby)
+
+    if df_farby_pivot is not None:
+        ew_c = fcol(df_farby_pivot, "Etykiety wierszy")
+        kf_c = fcol(df_farby_pivot, "Suma koszt farby2")
+        kp_c = fcol(df_farby_pivot, "Suma koszt płyty", "Suma koszt plyty")
+        if ew_c and kf_c and kp_c:
+            df_farby_pivot[ew_c] = df_farby_pivot[ew_c].astype(str).str.strip()
+            df_fp = (
+                df_farby_pivot[[ew_c, kf_c, kp_c]]
+                .rename(columns={ew_c: "_ew", kf_c: "Offset inks", kp_c: "Płyta offsetowa"})
+            )
+            df_fp["_ew"] = df_fp["_ew"].str[:10]
+            df_fp = df_fp.groupby("_ew").sum().reset_index()
+            df = df.merge(df_fp, left_on="Lewy 10", right_on="_ew", how="left")
+            df.drop(columns=["_ew"], errors="ignore", inplace=True)
+        else:
+            warns.append("Plik Farby: brak kolumn Etykiety / koszt farby / koszt płyty.")
+    else:
+        if uf_farby:
+            warns.append("Nie można wczytać pliku Farby.")
+
+    df["Offset inks"] = pd.to_numeric(df.get("Offset inks"), errors="coerce").fillna(0)
+    df["Płyta offsetowa"] = pd.to_numeric(df.get("Płyta offsetowa"), errors="coerce").fillna(0)
+
+    # ── 4. KLIKI / INKS ──────────────────────────────────────────────────────
+    df_kliki_out = None
+
+    if uf_inks:
+        try:
+            import io as _io
+            raw_inks = uf_inks.read()
+            uf_inks.seek(0)
+            df_inks = norm_df(pd.read_excel(_io.BytesIO(raw_inks)))
+            jn_c = fcol(df_inks, "Job Name")
+            pn_c = fcol(df_inks, "Press Name")
+            col_c = fcol(df_inks, "Color")
+            sep_c = fcol(df_inks, "Separations")
+
+            if jn_c and sep_c:
+                df_inks["Zamówienie"] = df_inks[jn_c].astype(str).str[:10]
+                df_inks["_seps"] = pd.to_numeric(
+                    df_inks[sep_c], errors="coerce"
+                ).fillna(0)
+
+                def _unit_cost(row) -> float:
+                    mach = str(row.get(pn_c, "")).strip() if pn_c else ""
+                    color = str(row.get(col_c, "")).strip() if col_c else ""
+                    cc = click_costs.get(mach, {})
+                    return cc.get(
+                        color,
+                        cc.get(
+                            "default",
+                            next((v.get("default", .05) for v in click_costs.values()), .05),
+                        ),
+                    )
+
+                df_inks["Koszt klików"] = df_inks.apply(_unit_cost, axis=1) * df_inks["_seps"]
+                grp_inks = (
+                    df_inks.groupby("Zamówienie")["Koszt klików"]
+                    .sum()
+                    .reset_index()
+                    .rename(columns={"Zamówienie": "_zk", "Koszt klików": "Moje Kliki"})
+                )
+                df = df.merge(grp_inks, left_on="Lewy 10", right_on="_zk", how="left")
+                df.drop(columns=["_zk"], errors="ignore", inplace=True)
+                df_kliki_out = df_inks.drop(columns=["_seps"], errors="ignore")
+            else:
+                warns.append("Plik Inks: brak kolumn Job Name / Separations.")
+        except Exception as exc:
+            warns.append(f"Błąd pliku Inks: {exc}")
+
+    df["Moje Kliki"] = pd.to_numeric(df.get("Moje Kliki"), errors="coerce").fillna(0)
+    kliki48_c = fcol(df, "Kliki [48]")
+    if kliki48_c:
+        df[kliki48_c] = pd.to_numeric(df[kliki48_c], errors="coerce").fillna(0)
+        df["Kliki final"] = df[[kliki48_c, "Moje Kliki"]].max(axis=1)
+    else:
+        df["Kliki final"] = df["Moje Kliki"]
+
+    # ── 5. SALES VALUE & DATA FAKTURY ────────────────────────────────────────
+    # Sales Value priority:
+    # 1) Wartość faktur from base file, if value != 0.
+    # 2) zlecenia + faktury by Numer zlecenia produkcyjnego, with negative corrections used only once.
+    # 3) Faktury-linie fallback only if client is not FD Pharma and row is valid production row.
+    # 4) no allowed match => Sales Value = 0.
+    #
+    # Data faktury / Miesiąc faktury are assigned independently from Sales Value:
+    # 1) zlecenia + faktury
+    # 2) Faktury-linie, conditionally
+    # 3) blank
+    df_zlec = None
+    df["Sales Value"] = np.nan
+    df["Data faktury"] = pd.NaT
+    df["_matched_source"] = ""
+
+    qty_fv_base_col = fcol(df, "Zamawiana ilość z FV", "Zamawiana ilosc z FV")
+    if not qty_fv_base_col:
+        qty_fv_base_col = fcol(df, "Zamawiana ilość", "Zamawiana ilosc")
+
+    invoice_value_col = fcol(df, "Wartość faktur", "Wartosc faktur", "Wartość faktury", "Wartosc faktury")
+    used_negative_corrections: set[str] = set()
+
+    # ── 5a. Base Profitability: Wartość faktur ───────────────────────────────
+    if invoice_value_col:
+        base_invoice_values = pd.to_numeric(df[invoice_value_col], errors="coerce").fillna(0)
+        mask_base_invoice = base_invoice_values != 0
+        df.loc[mask_base_invoice, "Sales Value"] = base_invoice_values.loc[mask_base_invoice]
+        df.loc[mask_base_invoice, "_matched_source"] = "Wartość faktur"
+
+    # ── 5b. zlecenia + faktury: sales and date source #1 for dates ───────────
+    if uf_zlec:
+        df_zlec = read_generic(uf_zlec)
+        if df_zlec is not None:
+            nzp_z = fcol(df_zlec, "Numer zlecenia produkcyjnego")
+            wart_z = fcol(df_zlec, "Wartosc w linii FV netto", "Wartość w linii FV netto")
+            data_z = fcol(df_zlec, "Data wystawienia FV", "Data wystawienia faktury")
+            ilosc_z = fcol(df_zlec, "Ilosc w linii FV", "Ilość w linii FV")
+
+            if nzp_z and wart_z:
+                zlec = df_zlec.copy()
+                zlec["_nzp"] = zlec[nzp_z].astype(str).str.strip()
+                zlec["_sales"] = pd.to_numeric(zlec[wart_z], errors="coerce")
+                zlec["_date"] = pd.to_datetime(zlec[data_z], errors="coerce") if data_z else pd.NaT
+                zlec["_qty"] = pd.to_numeric(zlec[ilosc_z], errors="coerce") if ilosc_z else np.nan
+                groups_z = {k: g.copy() for k, g in zlec.groupby("_nzp", dropna=False)}
+
+                def _sales_plus_negative(pos_row, group_all, zp_key: str):
+                    base_sales = float(pos_row["_sales"]) if pd.notna(pos_row["_sales"]) else 0.0
+                    negative_sum = 0.0
+                    if zp_key not in used_negative_corrections:
+                        negative_sum = group_all.loc[group_all["_sales"].fillna(0) < 0, "_sales"].sum(skipna=True)
+                        used_negative_corrections.add(zp_key)
+                    return base_sales + float(negative_sum)
+
+                def _match_sales_from_zlec(row):
+                    zp = str(row.get("Zlecenie produkcyjne", "")).strip()
+                    if not zp or zp not in groups_z:
+                        return pd.Series([np.nan, pd.NaT, "brak w zlec+FV"])
+
+                    g = groups_z[zp].copy()
+                    g_valid = g[g["_sales"].notna()].copy()
+                    if g_valid.empty:
+                        return pd.Series([np.nan, pd.NaT, "zlec+FV: brak wartości"])
+
+                    # Date from zlec+FV is independent. Use first available invoice date for this ZP.
+                    zlec_date = g_valid["_date"].dropna().iloc[0] if g_valid["_date"].notna().any() else pd.NaT
+
+                    positives = g_valid[g_valid["_sales"] >= 0].copy()
+                    if positives.empty:
+                        return pd.Series([np.nan, zlec_date, "zlec+FV: tylko korekty ujemne"])
+
+                    if len(positives) == 1:
+                        r = positives.iloc[0]
+                        return pd.Series([
+                            _sales_plus_negative(r, g_valid, zp),
+                            zlec_date if pd.notna(zlec_date) else r["_date"],
+                            "zlec+FV: NZP + korekty ujemne"
+                        ])
+
+                    if qty_fv_base_col:
+                        q = pd.to_numeric(row.get(qty_fv_base_col, np.nan), errors="coerce")
+                        try:
+                            q = float(q)
+                        except Exception:
+                            q = np.nan
+
+                        if pd.notna(q):
+                            gm = positives[np.isclose(positives["_qty"].fillna(-999999).astype(float), q, atol=0.01)]
+                            if len(gm) >= 1:
+                                r = gm.iloc[0]
+                                return pd.Series([
+                                    _sales_plus_negative(r, g_valid, zp),
+                                    zlec_date if pd.notna(zlec_date) else r["_date"],
+                                    "zlec+FV: NZP + ilość FV + korekty ujemne"
+                                ])
+
+                    return pd.Series([np.nan, zlec_date, "zlec+FV: brak dopasowania ilości"])
+
+                matched_sales = df.apply(_match_sales_from_zlec, axis=1)
+                matched_sales.columns = ["_matched_sales", "_matched_date", "_matched_source"]
+
+                # Date from zlec+FV always has priority, regardless of Sales Value source.
+                mask_date_zlec = matched_sales["_matched_date"].notna()
+                idx_date = matched_sales.loc[mask_date_zlec].index
+                df.loc[idx_date, "Data faktury"] = matched_sales.loc[idx_date, "_matched_date"].values
+
+                # Sales Value from zlec+FV only for rows still empty after Wartość faktur.
+                rows_for_zlec_sales = df.loc[matched_sales.index, "Sales Value"].isna()
+                mask_sales = matched_sales["_matched_sales"].notna() & rows_for_zlec_sales
+                idx_sales = matched_sales.loc[mask_sales].index
+                df.loc[idx_sales, "Sales Value"] = matched_sales.loc[idx_sales, "_matched_sales"].values
+                df.loc[idx_sales, "_matched_source"] = matched_sales.loc[idx_sales, "_matched_source"].values
+
+                blank_source = df.loc[matched_sales.index, "_matched_source"].fillna("").astype(str).str.strip() == ""
+                idx_blank = matched_sales.loc[blank_source].index
+                df.loc[idx_blank, "_matched_source"] = matched_sales.loc[idx_blank, "_matched_source"].values
+
+    # ── 5c. Faktury-linie: fallback for sales and date source #2 for dates ────
+    klient_col_for_fallback = klient_c if klient_c and klient_c in df.columns else fcol(df, "Klient")
+    zam_col_for_fallback = zam_c if zam_c and zam_c in df.columns else fcol(df, "Zamówienie", "Zamowienie")
+    fallback_machine_cols = [c for c in machine_cols if c in df.columns] if "machine_cols" in locals() else []
+
+    def _allow_invoice_line_fallback(row) -> bool:
+        klient_val = str(row.get(klient_col_for_fallback, "") if klient_col_for_fallback else "").strip().lower()
+        zam_val = str(row.get(zam_col_for_fallback, "") if zam_col_for_fallback else "").strip()
+        if klient_val == "fd pharma":
+            return False
+        if not zam_val:
+            return False
+        if "test" in zam_val.lower():
+            return False
+        if fallback_machine_cols:
+            vals = pd.to_numeric(row.reindex(fallback_machine_cols), errors="coerce").fillna(0)
+            if not (vals > 0).any():
+                return False
+        return True
+
+    if uf_fry:
+        df_fry = read_generic(uf_fry)
+        if df_fry is not None:
+            nl_c = fcol(df_fry, "Nazwa linii faktury")
+            wl_c = fcol(df_fry, "Wartosc w linii FV netto", "Wartość w linii FV netto")
+            il_c = fcol(df_fry, "Ilosc w linii FV", "Ilość w linii FV")
+            dl_c = fcol(df_fry, "Data wystawienia FV")
+
+            if nl_c and wl_c:
+                fry_names = df_fry[nl_c].fillna("").astype(str).str.lower().tolist()
+
+                for idx in df.index:
+                    row = df.loc[idx]
+
+                    if not _allow_invoice_line_fallback(row):
+                        if pd.isna(df.at[idx, "Sales Value"]):
+                            df.at[idx, "_matched_source"] = "fallback zablokowany"
+                        continue
+
+                    zam_val = str(row.get(zam_col_for_fallback, "") if zam_col_for_fallback else "").strip()
+                    lewy_val = str(row.get("Lewy 10", "") if "Lewy 10" in df.columns else "").strip()
+                    qty_val = sn(row.get(qty_fv_base_col, 0)) if qty_fv_base_col else sn(row.get(qty_c, 0) if qty_c else 0)
+
+                    candidates = []
+                    frag = extract_fry_fragment(zam_val)
+                    if frag:
+                        candidates.append(frag)
+                    if lewy_val:
+                        candidates.append(lewy_val)
+
+                    matched = []
+                    for candidate in candidates:
+                        c = str(candidate).strip().lower()
+                        if c:
+                            matched = [i for i, s in enumerate(fry_names) if c in s]
+                            if matched:
+                                break
+                    if not matched:
+                        continue
+
+                    found_row = df_fry.iloc[matched[0]]
+
+                    # Date from Faktury-linie only if zlec+FV did not provide date.
+                    if pd.isna(df.at[idx, "Data faktury"]) and dl_c:
+                        df.at[idx, "Data faktury"] = pd.to_datetime(found_row[dl_c], errors="coerce")
+
+                    # Sales Value from Faktury-linie only if still missing.
+                    if pd.isna(df.at[idx, "Sales Value"]):
+                        wart_fry = sn(found_row[wl_c])
+                        ilosc_fry = sn(found_row[il_c]) if il_c else 0
+                        if ilosc_fry > 0 and qty_val > 0:
+                            sv = (wart_fry / ilosc_fry) * qty_val
+                            source = "faktury linie: proporcja"
+                        else:
+                            sv = wart_fry
+                            source = "faktury linie: wartość linii"
+                        df.at[idx, "Sales Value"] = sv
+                        df.at[idx, "_matched_source"] = source
+
+    # Final rules: if no Sales Value source -> 0. Date remains blank only if neither source provided it.
+    df["Sales Value"] = pd.to_numeric(df["Sales Value"], errors="coerce").fillna(0)
+    df["Data faktury"] = pd.to_datetime(df["Data faktury"], errors="coerce")
+    df["Miesiąc faktury"] = df["Data faktury"].dt.strftime("%Y-%m")
+    df["Źródło Sales Value"] = df.get("_matched_source", "")
+
+    # ── 6. PREPRESS ───────────────────────────────────────────────────────────
+    def _prepress(row) -> float:
+        klient = str(row.get(klient_c, "") if klient_c else "").strip()
+        oi = sn(row.get("Offset inks", 0))
+        cfg = prepress.get(klient, {})
+        if cfg:
+            return cfg.get(
+                "offset" if oi > 0 else "digital",
+                pp_offset if oi > 0 else pp_digital,
+            )
+        return pp_offset if oi > 0 else pp_digital
+
+    df["Prepress costs"] = df.apply(_prepress, axis=1)
+
+    # ── 7. OTHER MATERIALS ────────────────────────────────────────────────────
+    df["Other Materials"] = df["Sales Value"] * (other_pct / 100.0)
+
+    # ── 7b. ORDERS / TEKTURA / TOOLS / GILOTYNA EXTENSION ────────────────────
+    # Added without changing existing Sales Value / Data faktury / TPM / CM logic.
+
+    def _safe_num_series(s):
+        return pd.to_numeric(s, errors="coerce").fillna(0)
+
+    # 1) Usługa na surowcu already comes with mindex + liczba_cięć from reader.
+    # 2) Tektura: add liczba cięć by mindex.
+    df_tektura_out = df_tektura_extra.copy() if df_tektura_extra is not None else None
+    df_material_out = df_material_extra.copy() if df_material_extra is not None else None
+    df_orders_out = df_orders_extra.copy() if df_orders_extra is not None else None
+
+    if df_tektura_out is not None and not df_tektura_out.empty and df_material_out is not None and not df_material_out.empty:
+        tek_mx = fcol(df_tektura_out, "mindex")
+        mat_mx = fcol(df_material_out, "mindex")
+        mat_cuts = fcol(df_material_out, "liczba_cięć", "liczba cięć", "liczba_ciec")
+        if tek_mx and mat_mx and mat_cuts:
+            tmp_mat = df_material_out[[mat_mx, mat_cuts]].copy()
+            tmp_mat[mat_mx] = tmp_mat[mat_mx].astype(str).str.strip()
+            tmp_mat[mat_cuts] = pd.to_numeric(tmp_mat[mat_cuts], errors="coerce").fillna(0)
+            cuts_map = tmp_mat.drop_duplicates(mat_mx, keep="first").set_index(mat_mx)[mat_cuts].to_dict()
+            df_tektura_out["liczba cięć"] = df_tektura_out[tek_mx].astype(str).str.strip().map(cuts_map).fillna(0)
+        else:
+            if "liczba cięć" not in df_tektura_out.columns:
+                df_tektura_out["liczba cięć"] = 0
+
+    # 3) Profitability: liczba cięć by Zlecenie produkcyjne -> tektura[job_name]
+    df["liczba cięć"] = 0.0
+    if df_tektura_out is not None and not df_tektura_out.empty:
+        job_c = fcol(df_tektura_out, "job_name")
+        cuts_c = fcol(df_tektura_out, "liczba cięć", "liczba_cięć", "liczba_ciec")
+        if job_c and cuts_c and "Zlecenie produkcyjne" in df.columns:
+            tmp_tek = df_tektura_out[[job_c, cuts_c]].copy()
+            tmp_tek[job_c] = tmp_tek[job_c].astype(str).str.strip()
+            tmp_tek[cuts_c] = pd.to_numeric(tmp_tek[cuts_c], errors="coerce").fillna(0)
+            cuts_job_map = tmp_tek.drop_duplicates(job_c, keep="first").set_index(job_c)[cuts_c].to_dict()
+            df["liczba cięć"] = df["Zlecenie produkcyjne"].astype(str).str.strip().map(cuts_job_map).fillna(0)
+
+    # 4) Orders: Format and Die cut by Lewy 10 / Kohlpharma special key.
+    df["Format"] = ""
+    df["Die cut"] = ""
+    if df_orders_out is not None and not df_orders_out.empty:
+        ord_key = fcol(df_orders_out, "Numer-Linia", "Numer Linia", "Numer-linia", "Numer_Linia")
+        ord_format = fcol(df_orders_out, "Format")
+        ord_die = fcol(df_orders_out, "Wykrojnik", "Die cut", "Die Cut")
+        if ord_key:
+            tmp_ord = df_orders_out.copy()
+            tmp_ord["_lookup_key"] = tmp_ord[ord_key].astype(str).str.strip()
+            fmt_map = tmp_ord.drop_duplicates("_lookup_key", keep="first").set_index("_lookup_key")[ord_format].to_dict() if ord_format else {}
+            die_map = tmp_ord.drop_duplicates("_lookup_key", keep="first").set_index("_lookup_key")[ord_die].to_dict() if ord_die else {}
+
+            def _orders_lookup_key(row):
+                klient_val = str(row.get(klient_c, "") if klient_c else row.get("Klient", "")).strip().lower()
+                zam_val = str(row.get("Zamówienie", row.get("Zamowienie", ""))).strip()
+                lewy_val = str(row.get("Lewy 10", "")).strip()
+                if klient_val == "kohlpharma" and " |" in zam_val:
+                    return zam_val.split(" |", 1)[0].strip()
+                if klient_val == "kohlpharma" and "|" in zam_val:
+                    return zam_val.split("|", 1)[0].strip()
+                return lewy_val
+
+            lookup_keys = df.apply(_orders_lookup_key, axis=1)
+            if fmt_map:
+                df["Format"] = lookup_keys.map(fmt_map).fillna("")
+            if die_map:
+                df["Die cut"] = lookup_keys.map(die_map).fillna("")
+
+    # 5) Tools: Nesting by Die cut -> Nazwa narzędzia.
+    df["Nesting"] = 0.0
+    if df_tools is not None and not df_tools.empty:
+        tool_name = fcol(df_tools, "Nazwa narzędzia")
+        tool_nesting = fcol(df_tools, "Ilość użytków wykrojnika / Nesting", "Ilość użytków wykrojnika/Nesting", "nesting")
+        if tool_name and tool_nesting:
+            tmp_tools = df_tools[[tool_name, tool_nesting]].copy()
+            tmp_tools[tool_name] = tmp_tools[tool_name].astype(str).str.strip()
+            tmp_tools[tool_nesting] = pd.to_numeric(tmp_tools[tool_nesting], errors="coerce").fillna(0)
+            nesting_map = tmp_tools.drop_duplicates(tool_name, keep="first").set_index(tool_name)[tool_nesting].to_dict()
+            df["Nesting"] = df["Die cut"].astype(str).str.strip().map(nesting_map).fillna(0)
+
+    # 6) Koszt gilotyny.
+    qty_for_g = fcol(df, "Zamawiana ilość z FV", "Zamawiana ilosc z FV")
+    if not qty_for_g:
+        qty_for_g = fcol(df, "Zamawiana ilość", "Zamawiana ilosc")
+    g_row = lookup_wydajnosc_row(df_wydajnosc, "gilotyna") if df_wydajnosc is not None else {}
+    g_eff = sn(g_row.get("Wydajność", 0))
+    qty_g = pd.to_numeric(df[qty_for_g], errors="coerce").fillna(0) if qty_for_g else 0
+    nesting_g = pd.to_numeric(df["Nesting"], errors="coerce").fillna(0)
+    cuts_g = pd.to_numeric(df["liczba cięć"], errors="coerce").fillna(0)
+    df["koszt gilotyny"] = np.where(
+        (nesting_g > 0) & (cuts_g > 0) & (g_eff > 0),
+        ((qty_g / nesting_g) / cuts_g) * g_eff,
+        0.0,
+    )
+
+    # ── 8. TOTAL DL ──────────────────────────────────────────────────────────
+    dl_components = machine_cols + ["Prepress costs", "koszt gilotyny"]
+    for col in dl_components:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df["Total DL"] = df[dl_components].sum(axis=1)
+
+    # ── 9. TOTAL MATERIALS ────────────────────────────────────────────────────
+    MAT_NAMES = [
+        "Papier [16]", "Klej [17]", "Lakiery [20]",
+        "Opakowania zbiorcze [24]", "Other Materials",
+        "Offset inks", "Płyta offsetowa", "Kliki final",
+    ]
+    mat_cols_used: list[str] = []
+    for mc in MAT_NAMES:
+        rc = fcol(df, mc)
+        if rc:
+            df[rc] = pd.to_numeric(df[rc], errors="coerce").fillna(0)
+            mat_cols_used.append(rc)
+        else:
+            df[mc] = 0.0
+            mat_cols_used.append(mc)
+    df["Total Materials"] = df[mat_cols_used].sum(axis=1)
+
+    # ── 9b. CHECK SPRZEDAŻ ────────────────────────────────────────────────────
+    qty_fv_col = fcol(df, "Zamawiana ilość z FV", "Zamawiana ilosc z FV")
+    if not qty_fv_col:
+        qty_fv_col = fcol(df, "Zamawiana ilość", "Zamawiana ilosc")
+    sales_col = fcol(df, "Sales Value")
+
+    if qty_fv_col and sales_col:
+        qty_cmp = pd.to_numeric(df[qty_fv_col], errors="coerce").fillna(0)
+        sales_cmp = pd.to_numeric(df[sales_col], errors="coerce").fillna(0)
+        df["check sprzedaż"] = np.where(
+            np.isclose(qty_cmp, sales_cmp, atol=0.01),
+            "OK",
+            "NOK",
+        )
+    else:
+        df["check sprzedaż"] = ""
+
+    # ── 10. TPM, CM, TPM% & CM% ──────────────────────────────────────────────
+    # User definition:
+    #   TPM  = Sales Value - Total Materials
+    #   TPM% = 100% * TPM / Sales Value
+    #   CM%  = 100% * CM  / Sales Value
+    # CM remains contribution after direct labour:
+    #   CM = Sales Value - Total Materials - Total DL
+    df["TPM"] = df["Sales Value"] - df["Total Materials"]
+    df["CM"] = df["Sales Value"] - df["Total Materials"] - df["Total DL"]
+    df["TPM%"] = np.where(df["Sales Value"] != 0, df["TPM"] / df["Sales Value"], 0.0)
+    df["CM%"] = np.where(df["Sales Value"] != 0, df["CM"] / df["Sales Value"], 0.0)
+
+    # ── 11. COLUMN ORDER ─────────────────────────────────────────────────────
+    TAIL = ["Total DL", "Total Materials", "Sales Value",
+            "Data faktury", "Miesiąc faktury", "TPM", "TPM%", "CM", "CM%"]
+    other_cols = [c for c in df.columns if c not in TAIL]
+    df = df[[c for c in other_cols + TAIL if c in df.columns]]
+    df = df[[c for c in df.columns if not c.startswith("_")]]
+
+    return {
+        "df_prof": df,
+        "df_czasy": df_czasy_raw,
+        "df_kliki": df_kliki_out,
+        "df_farby_pivot": df_farby_pivot,
+        "df_orders": df_orders_out,
+        "df_tektura": df_tektura_out,
+        "df_material": df_material_out,
+        "machine_cols": machine_cols,
+        "mat_cols": mat_cols_used,
+        "klient_col": klient_c,
+        "qty_col": qty_c,
+        "warns": warns,
+    }, warns
