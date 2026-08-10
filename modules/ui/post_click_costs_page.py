@@ -9,11 +9,11 @@ from modules.utils.session import upload_key, store_uploaded_file
 DEFAULT_CLICK_COSTS: dict[str, dict[str, float]] = {
     "HP Indigo 7K Digital Press": {
         "Yellow": .05, "Magenta": .05, "Cyan": .05,
-        "Black": .05, "Violet": .06, "Orange": .06, "default": .05,
+        "Black": .05, "Violet": .06, "Orange": .06, "Green": .06, "default": .05,
     },
     "HP Indigo 35K Digital Press": {
         "Yellow": .04, "Magenta": .04, "Cyan": .04,
-        "Black": .04, "Violet": .05, "Orange": .05, "default": .04,
+        "Black": .04, "Violet": .05, "Orange": .05, "Green": .05, "default": .04,
     },
 }
 

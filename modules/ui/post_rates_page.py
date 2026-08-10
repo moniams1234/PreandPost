@@ -9,7 +9,7 @@ from modules.utils.session import upload_key, store_uploaded_file
 DEFAULT_MACHINE_RATES: dict[str, float] = {
     "HP35K": 129.8224, "Maszyna lakierująca 2/Cyfra": 89.2784,
     "Easy-matrix 1": 117.2226, "Wyrywanie ręczne": 66.15,
-    "Pakowanie": 59.535, "KBA 1_4": 113.9103, "BOBST": 155.4645,
+    "Pakowanie": 59.535, "KBA 1_4": 113.9103, "BOBST1 106 E3.0": 155.4645,
     "Sklejarka 4": 125.0307, "ProWax": 76.4032, "HP7K": 118.1607,
     "Maszyna lakierująca 1/ Cyfra +SP": 89.2784, "Windmill 6": 79.4041,
     "Sklejarka 2": 125.0307, "Windmill 5": 79.4041, "Assembling 4": 49.65,
