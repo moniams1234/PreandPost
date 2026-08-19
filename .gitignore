@@ -3,3 +3,4 @@ data/*.db-shm
 data/*.db-wal
 __pycache__/
 *.py[cod]
+streamlit-test*.log

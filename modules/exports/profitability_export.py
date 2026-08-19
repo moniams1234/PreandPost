@@ -38,15 +38,26 @@ def build_xlsx(
     other_pct: float,
     tpm_thr: float,
     cm_thr: float,
+    month_from: str | None = None,
+    month_to: str | None = None,
 ) -> io.BytesIO:
-    """Build full PostKalkulacja XLSX and return BytesIO."""
+    """Build PostKalkulacja XLSX, optionally limited to an invoice-month range."""
     from modules.calculations.profitability_engine import exclude_oticon_zam_rows
 
     wb = Workbook()
     for ws in wb.worksheets:
         wb.remove(ws)
 
-    df_prof = result["df_prof"]
+    df_prof = result["df_prof"].copy()
+    if "Miesiąc faktury" in df_prof.columns:
+        if month_from:
+            df_prof = df_prof[
+                df_prof["Miesiąc faktury"].astype("string") >= month_from
+            ]
+        if month_to:
+            df_prof = df_prof[
+                df_prof["Miesiąc faktury"].astype("string") <= month_to
+            ]
     df_prof_report = exclude_oticon_zam_rows(df_prof, result.get("klient_col"))
     df_czasy = result["df_czasy"]
     df_kliki = result["df_kliki"]
