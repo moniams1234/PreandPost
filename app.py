@@ -94,10 +94,26 @@ def recalculate_profitability(show_success: bool = True) -> bool:
     from modules.readers.orders_reader import read_prekalk_orders
     from modules.readers.tools_reader import read_prekalk_tools, empty_tools_df
     from modules.readers.wydajnosc_reader import read_prekalk_wydajnosc, empty_wydajnosc_df
+    from modules.storage.supplementary_db import upsert_dataframe
 
-    _df_mat  = read_prekalk_material_service(current_file("post_material"))
-    _df_tek  = read_prekalk_tektura(current_file("post_tektura"))
-    _df_ord  = read_prekalk_orders(current_file("post_orders"))
+    _df_mat_uploaded = read_prekalk_material_service(current_file("post_material"))
+    _df_tek_uploaded = read_prekalk_tektura(current_file("post_tektura"))
+    _df_ord_uploaded = read_prekalk_orders(current_file("post_orders"))
+
+    _df_mat, _mat_stats = upsert_dataframe(
+        "material_service", _df_mat_uploaded, ("mindex",)
+    )
+    _df_ord, _ord_stats = upsert_dataframe(
+        "orders", _df_ord_uploaded, ("Numer-Linia", "Numer Linia", "Numer_Linia")
+    )
+    _df_tek, _tek_stats = upsert_dataframe(
+        "tektura", _df_tek_uploaded, ("job_name", "job name")
+    )
+    st.session_state["supplementary_db_stats"] = {
+        "Usługa na surowcu": _mat_stats,
+        "Orders": _ord_stats,
+        "Tektura": _tek_stats,
+    }
 
     # Default Tools/Wydajność must be available without visiting their tabs.
     # If user saved/recalculated edited/uploaded data, use session_state.
@@ -145,6 +161,14 @@ def recalculate_profitability(show_success: bool = True) -> bool:
                 f"Sprzedaż: {sv_sum:,.0f} PLN · "
                 f"Miesięcy: {df['Miesiąc faktury'].nunique() if 'Miesiąc faktury' in df.columns else 0}"
             )
+            _added = sum(s["inserted"] for s in st.session_state["supplementary_db_stats"].values())
+            _changed = sum(s["updated"] for s in st.session_state["supplementary_db_stats"].values())
+            _same = sum(s["unchanged"] for s in st.session_state["supplementary_db_stats"].values())
+            if _added or _changed or _same:
+                st.info(
+                    f"Baza danych: dodano {_added}, zaktualizowano {_changed}, "
+                    f"pominięto duplikatów {_same}."
+                )
         for w in warns:
             st.warning(w)
         return True
