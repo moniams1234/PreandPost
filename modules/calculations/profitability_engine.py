@@ -254,8 +254,8 @@ def build_profitability(
         if uf_farby:
             warns.append("Nie można wczytać pliku Farby.")
 
-    df["Offset inks"] = pd.to_numeric(df.get("Offset inks"), errors="coerce").fillna(0)
-    df["Płyta offsetowa"] = pd.to_numeric(df.get("Płyta offsetowa"), errors="coerce").fillna(0)
+    df["Offset inks"] = pd.to_numeric(df.get("Offset inks", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0)
+    df["Płyta offsetowa"] = pd.to_numeric(df.get("Płyta offsetowa", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0)
 
     # ── 4. KLIKI / INKS ──────────────────────────────────────────────────────
     df_kliki_out = None
@@ -304,7 +304,7 @@ def build_profitability(
         except Exception as exc:
             warns.append(f"Błąd pliku Inks: {exc}")
 
-    df["Moje Kliki"] = pd.to_numeric(df.get("Moje Kliki"), errors="coerce").fillna(0)
+    df["Moje Kliki"] = pd.to_numeric(df.get("Moje Kliki", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0)
     kliki48_c = fcol(df, "Kliki [48]")
     if kliki48_c:
         df[kliki48_c] = pd.to_numeric(df[kliki48_c], errors="coerce").fillna(0)
